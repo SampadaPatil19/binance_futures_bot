@@ -1,0 +1,310 @@
+"""
+Simplified Binance Futures (USDT-M) Trading Bot
+File: binance_futures_bot.py
+Description: Command-line trading bot for Binance Futures Testnet (https://testnet.binancefuture.com)
+Features:
+ - Place MARKET and LIMIT orders (BUY/SELL)
+ - Optional STOP-LIMIT order (STOP)
+ - Input validation via CLI (argparse)
+ - Logging of requests, responses and errors (rotating file handler)
+ - Structured, reusable code
+ - Extra deliverables included below: requirements.txt, sample logs, README details & packaging notes
+
+Usage examples (after setting API keys):
+ python binance_futures_bot.py place-order --symbol BTCUSDT --side BUY --type MARKET --quantity 0.001
+ python binance_futures_bot.py place-order --symbol BTCUSDT --side SELL --type LIMIT --price 30000 --quantity 0.001
+ python binance_futures_bot.py place-order --symbol BTCUSDT --side BUY --type STOP --price 29600 --stop-price 29500 --quantity 0.001
+
+Note: This script uses direct REST calls and HMAC signing (no external Binance SDK required by default).
+Make sure you use Testnet API keys and set environment variables or pass keys via --api-key/--api-secret (not recommended on shared machines).
+
+"""
+
+import os
+import time
+import hmac
+import hashlib
+import requests
+import logging
+from logging.handlers import RotatingFileHandler
+import argparse
+import json
+from urllib.parse import urlencode
+from dotenv import load_dotenv
+import os
+
+load_dotenv()  # loads from .env
+
+api_key = os.getenv("BINANCE_API_KEY")
+api_secret = os.getenv("BINANCE_API_SECRET")
+
+
+# ------------------------ Configuration ------------------------
+TESTNET_BASE = os.environ.get('BINANCE_TESTNET_BASE', 'https://testnet.binancefuture.com')
+DEFAULT_LOG = os.environ.get('BINANCE_BOT_LOG', 'binance_bot.log')
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+
+# ------------------------ Logging Setup ------------------------
+logger = logging.getLogger('binance_bot')
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    rhandler = RotatingFileHandler(DEFAULT_LOG, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
+    formatter = logging.Formatter('%(asctime)s — %(levelname)s — %(message)s')
+    rhandler.setFormatter(formatter)
+    logger.addHandler(rhandler)
+
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter('%(message)s'))
+logger.addHandler(console)
+
+# ------------------------ Exceptions ------------------------
+class BinanceAPIError(Exception):
+    pass
+
+# ------------------------ Helper: Sign and Send ------------------------
+class BinanceFuturesREST:
+    def __init__(self, api_key: str, api_secret: str, base_url: str = TESTNET_BASE):
+        if not api_key or not api_secret:
+            raise ValueError('API key and secret are required')
+        self.api_key = api_key
+        self.api_secret = api_secret.encode('utf-8')
+        self.base_url = base_url.rstrip('/')
+        self.session = requests.Session()
+        self.session.headers.update({'X-MBX-APIKEY': self.api_key})
+
+    def _sign(self, params: dict) -> str:
+        query = urlencode(params, doseq=True)
+        signature = hmac.new(self.api_secret, query.encode('utf-8'), hashlib.sha256).hexdigest()
+        return signature
+
+    def _send_signed_request(self, method: str, path: str, params: dict = None) -> dict:
+        if params is None:
+            params = {}
+        # add timestamp and recvWindow
+        params.update({'timestamp': int(time.time() * 1000)})
+        # default recvWindow can be adjusted
+        params.setdefault('recvWindow', 5000)
+        signature = self._sign(params)
+        params['signature'] = signature
+        url = f"{self.base_url}{path}"
+        logger.debug(f"Request URL: {url}")
+        logger.debug(f"Request params: {params}")
+        try:
+            if method.upper() == 'POST':
+                resp = self.session.post(url, params=params, timeout=10)
+            elif method.upper() == 'GET':
+                resp = self.session.get(url, params=params, timeout=10)
+            elif method.upper() == 'DELETE':
+                resp = self.session.delete(url, params=params, timeout=10)
+            else:
+                raise ValueError('Unsupported HTTP method')
+        except requests.RequestException as e:
+            logger.exception('Network error when calling Binance API')
+            raise BinanceAPIError(f'Network error: {str(e)}')
+
+        logger.debug(f"Response status: {resp.status_code}")
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.error('Failed to decode JSON response')
+            raise BinanceAPIError(f'Non-JSON response: {resp.text}')
+
+        if not resp.ok:
+            # log error and raise
+            logger.error('Binance API returned error: %s', json.dumps(data))
+            raise BinanceAPIError(data)
+
+        # success
+        logger.info('Binance API success: %s', json.dumps(data))
+        return data
+
+    # place futures order (USDT-M)
+    def place_order(self, symbol: str, side: str, order_type: str, quantity: float = None,
+                    price: float = None, stop_price: float = None, time_in_force: str = 'GTC',
+                    reduce_only: bool = False, close_position: bool = False) -> dict:
+        path = '/fapi/v1/order'
+        side = side.upper()
+        order_type = order_type.upper()
+        payload = {
+            'symbol': symbol.upper(),
+            'side': side,
+            'type': order_type,
+            # recvWindow & timestamp added in signer
+        }
+
+        # quantity is required for MARKET and LIMIT in most cases
+        if quantity is not None:
+            payload['quantity'] = float(quantity)
+
+        if order_type == 'MARKET':
+            # quantity required
+            if 'quantity' not in payload:
+                raise ValueError('quantity is required for market orders')
+        elif order_type == 'LIMIT':
+            if price is None or 'quantity' not in payload:
+                raise ValueError('price and quantity are required for limit orders')
+            payload['price'] = str(price)
+            payload['timeInForce'] = time_in_force
+        elif order_type == 'STOP' or order_type == 'STOP_MARKET' or order_type == 'TAKE_PROFIT':
+            # we implement a STOP (stop-limit) variant where both stopPrice and price are provided
+            if stop_price is None or price is None or 'quantity' not in payload:
+                raise ValueError('stop_price, price and quantity are required for stop-limit orders')
+            # For futures, "STOP" is a valid type but exchanges sometimes expect "STOP" with "stopPrice" and "price".
+            payload['stopPrice'] = str(stop_price)
+            payload['price'] = str(price)
+            payload['timeInForce'] = time_in_force
+        else:
+            raise ValueError(f'Unsupported order type: {order_type}')
+
+        # optional flags
+        if reduce_only:
+            payload['reduceOnly'] = 'true'
+        if close_position:
+            payload['closePosition'] = 'true'
+
+        return self._send_signed_request('POST', path, payload)
+
+# ------------------------ CLI & Input Validation ------------------------
+
+def positive_float(value):
+    try:
+        f = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Not a float: {value}")
+    if f <= 0:
+        raise argparse.ArgumentTypeError(f"Expected positive number, got {value}")
+    return f
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description='Simplified Binance Futures Trading Bot (Testnet)')
+    sub = parser.add_subparsers(dest='command', required=True)
+
+    # place-order command
+    p_place = sub.add_parser('place-order', help='Place an order on Binance Futures Testnet')
+    p_place.add_argument('--api-key', help='Binance API Key (or set BINANCE_API_KEY env var)')
+    p_place.add_argument('--api-secret', help='Binance API Secret (or set BINANCE_API_SECRET env var)')
+    p_place.add_argument('--base-url', default=TESTNET_BASE, help='Testnet base URL (default from env or code)')
+    p_place.add_argument('--symbol', required=True, help='Trading symbol e.g. BTCUSDT')
+    p_place.add_argument('--side', required=True, choices=['BUY', 'SELL', 'buy', 'sell'], help='BUY or SELL')
+    p_place.add_argument('--type', required=True, choices=['MARKET', 'LIMIT', 'STOP', 'market', 'limit', 'stop'], help='Order type')
+    p_place.add_argument('--quantity', type=positive_float, help='Order quantity (required for MARKET/LIMIT/STOP)')
+    p_place.add_argument('--price', type=positive_float, help='Limit price (required for LIMIT and STOP)')
+    p_place.add_argument('--stop-price', type=positive_float, dest='stop_price', help='Stop price for STOP orders')
+    p_place.add_argument('--time-in-force', default='GTC', help='Time in force for LIMIT orders (GTC/IOC/FOK)')
+    p_place.add_argument('--reduce-only', action='store_true', help='Set reduceOnly flag (futures)')
+    p_place.add_argument('--close-position', action='store_true', help='Set closePosition flag (futures)')
+
+    # health check command (optional)
+    p_health = sub.add_parser('ping', help='Ping testnet API')
+    p_health.add_argument('--api-key', help='Binance API Key (or set BINANCE_API_KEY env var)')
+
+    return parser
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # safe base_url from args (if provided) or default TESTNET_BASE
+    base_url = getattr(args, "base_url", TESTNET_BASE)
+
+    # --- ping is a public endpoint, no API secret needed ---
+    if args.command == 'ping':
+        url = base_url.rstrip('/') + '/fapi/v1/ping'
+        try:
+            r = requests.get(url, timeout=5)
+            r.raise_for_status()
+            print('Testnet ping OK')
+            logger.info('Ping OK: %s', r.text)
+        except Exception as e:
+            logger.exception('Ping failed')
+            print('Ping failed:', str(e))
+        return
+
+    # --- for other commands (place-order) load API keys safely ---
+    api_key = getattr(args, 'api_key', None) or os.environ.get('BINANCE_API_KEY') or os.environ.get('BINANCE_TESTNET_APIKEY')
+    api_secret = getattr(args, 'api_secret', None) or os.environ.get('BINANCE_API_SECRET') or os.environ.get('BINANCE_TESTNET_SECRET')
+
+    if args.command == 'ping':
+        print("DEBUG: Entered ping block, sending request...")  # debug line
+        url = base_url.rstrip('/') + '/fapi/v1/ping'
+        try:
+            r = requests.get(url, timeout=5)
+            print("DEBUG: Got response:", r.status_code, r.text)  # debug line
+            r.raise_for_status()
+            print('Testnet ping OK')
+            logger.info('Ping OK: %s', r.text)
+        except Exception as e:
+            logger.exception('Ping failed')
+            print('Ping failed:', str(e))
+        return
+
+
+
+    if args.command == 'place-order':
+        # basic validation
+        if not api_key or not api_secret:
+            print('API key/secret required: pass --api-key/--api-secret or set BINANCE_API_KEY/BINANCE_API_SECRET environment variables')
+            return
+
+        client = BinanceFuturesREST(api_key, api_secret, base_url=base_url)
+        try:
+            order = client.place_order(
+                symbol=args.symbol,
+                side=args.side,
+                order_type=args.type,
+                quantity=args.quantity,
+                price=args.price,
+                stop_price=args.stop_price,
+                time_in_force=args.time_in_force,
+                reduce_only=args.reduce_only,
+                close_position=args.close_position
+            )
+            # Print concise result for CLI
+            print('Order placed successfully:')
+            print(json.dumps(order, indent=2))
+            logger.info('Order placed: %s', json.dumps(order))
+        except BinanceAPIError as e:
+            logger.error('Failed to place order: %s', e)
+            print('Failed to place order. See logs for details.')
+        except ValueError as e:
+            logger.error('Validation error: %s', e)
+            print('Validation error:', e)
+        except Exception as e:
+            logger.exception('Unexpected error')
+            print('Unexpected error:', e)
+
+if __name__ == "__main__":
+    main()
+
+
+# ------------------------ Additional Deliverables ------------------------
+# 1) requirements.txt (recommended):
+#    requests>=2.28.0
+#    (Only requests is needed; if you prefer python-binance, add python-binance>=1.0.16)
+#
+# 2) sample .gitignore
+#    *.pyc
+#    __pycache__/
+#    binance_bot.log
+#
+# 3) Sample binance_bot.log (what to send with submission):
+#    2025-09-09 10:00:00 — INFO — Binance API success: {"orderId":12345,...}
+#    2025-09-09 10:00:01 — ERROR — Binance API returned error: {"code":-2019,"msg":"Margin is insufficient."}
+#
+# 4) README / Submission checklist (what to email):
+#    - Resume (PDF)
+#    - GitHub repo link (include this script at repo root)
+#    - binance_bot.log (generated during your test runs)
+#    - Short note in email describing how to run the script and the testnet keys used (testnet only)
+#
+# 5) Optional enhancements I can add right away (I will implement if you say "go"): 
+#    - Add a small interactive CLI menu (run without args shows choices)
+#    - Add OCO or TWAP example (OCO requires multiple endpoints; I can implement a simple OCO by placing two orders and cancelling one)
+#    - Add unit tests (pytest) with mocked responses
+#    - Package as a small Git repo and create a sample GitHub-ready README.md and requirements.txt
+#    - Provide a sample binance_bot.log with both success and error scenarios generated locally (sanitized)
+#
+# Security reminder: Use Testnet keys only for this assignment. Never commit your secret keys to a public repo.
