@@ -7,11 +7,9 @@ A command-line Python trading bot for Binance Futures Testnet (USDT-M) that supp
 ## Features
 
 - Place MARKET and LIMIT orders on Binance Futures Testnet.
-- Optional STOP-LIMIT order support.
 - Input validation via CLI (argparse).
 - Logging of API requests, responses, and errors (rotating log file).
 - Structured and reusable Python code.
-- Can be easily extended for advanced order types (OCO, TWAP, etc.).
 
 ---
 
